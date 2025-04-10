@@ -12,6 +12,8 @@ function Test-URLValid {
         $request = [System.Net.WebRequest]::Create($URL)
         $request.Method = "HEAD"
         $request.Timeout = 5000
+        $request.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        $request.Referer = "https://www.amd.com/"
         $response = $request.GetResponse()
         $statusCode = [int]$response.StatusCode
         return $statusCode -eq 200
@@ -41,33 +43,117 @@ function Get-AMDDriverDownload {
         # Configure TLS and connection settings
         [System.Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         [System.Net.ServicePointManager]::DefaultConnectionLimit = 100
+        [System.Net.ServicePointManager]::DnsRefreshTimeout = 0
+        [System.Net.ServicePointManager]::EnableDnsRoundRobin = $true
 
         # Try up to 3 times
         $maxRetries = 3
         $retryCount = 0
         $success = $false
         $pageContent = $null
-
+        $baseTimeout = 30  # Base timeout in seconds
+        
         while (-not $success -and $retryCount -lt $maxRetries) {
             $retryCount++
+            $currentTimeout = $baseTimeout * $retryCount  # Progressive timeout
+            
             try {
                 Write-Host "Attempt $retryCount of $maxRetries`: Searching for WHQL Recommended driver..." -ForegroundColor Yellow
                 
-                $request = [System.Net.WebRequest]::Create('https://www.amd.com/en/support/downloads/drivers.html/processors/ryzen/ryzen-7000-series/amd-ryzen-7-7840u.html')
-                $request.Timeout = 30000 # 30 seconds
-                $request.UserAgent = "Mozilla/5.0"
+                # Test DNS resolution first
+                try {
+                    $dnsResult = [System.Net.Dns]::GetHostEntry("www.amd.com")
+                    Write-Host "DNS Resolution successful: $($dnsResult.AddressList[0])" -ForegroundColor Green
+                }
+                catch {
+                    Write-Host "DNS Resolution failed: $_" -ForegroundColor Red
+                }
                 
-                $response = $request.GetResponse()
-                $stream = $response.GetResponseStream()
-                $reader = New-Object System.IO.StreamReader($stream)
-                $pageContent = $reader.ReadToEnd()
+                $url = 'https://www.amd.com/en/support/downloads/drivers.html/processors/ryzen/ryzen-7000-series/amd-ryzen-7-7840u.html'
+                
+                # Special headers that need to be set via properties
+                $specialHeaders = @{
+                    "UserAgent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                    "Accept"    = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+                    "Referer"   = "https://www.amd.com/"
+                    "Host"      = "www.amd.com"
+                }
+                
+                # Regular headers that can be set via Headers collection
+                $headers = @{
+                    "Accept-Language"           = "en-US,en;q=0.9"
+                    "Cache-Control"             = "no-cache"
+                    "sec-ch-ua"                 = "`"Not_A Brand`";v=`"8`", `"Chromium`";v=`"120`""
+                    "sec-ch-ua-mobile"          = "?0"
+                    "sec-ch-ua-platform"        = "`"Windows`""
+                    "Sec-Fetch-Dest"            = "document"
+                    "Sec-Fetch-Mode"            = "navigate"
+                    "Sec-Fetch-Site"            = "same-origin"
+                    "Sec-Fetch-User"            = "?1"
+                    "Upgrade-Insecure-Requests" = "1"
+                }
+
+                # Configure request
+                [System.Net.ServicePointManager]::Expect100Continue = $false
+                $request = [System.Net.WebRequest]::Create($url)
+                
+                # Set special headers via properties
+                $request.UserAgent = $specialHeaders["UserAgent"]
+                $request.Accept = $specialHeaders["Accept"]
+                $request.Referer = $specialHeaders["Referer"]
+                $request.Host = $specialHeaders["Host"]
+                
+                # Set regular headers via Headers collection
+                foreach ($header in $headers.GetEnumerator()) {
+                    $request.Headers[$header.Key] = $header.Value
+                }
+                
+                $request.Timeout = $currentTimeout * 1000
+                $request.AllowAutoRedirect = $true
+                
+                Write-Host "`nConnection Settings:" -ForegroundColor Cyan
+                Write-Host "Timeout: $currentTimeout seconds" -ForegroundColor Yellow
+                Write-Host "Using Proxy: $([System.Net.WebRequest]::DefaultWebProxy.GetProxy($url))" -ForegroundColor Yellow
+
+                Write-Host "`nRequest Details:" -ForegroundColor Cyan
+                Write-Host "URL: $url" -ForegroundColor Yellow
+                Write-Host "Headers:" -ForegroundColor Yellow
+                $headers.GetEnumerator() | ForEach-Object {
+                    Write-Host "  $($_.Key): $($_.Value)" -ForegroundColor Gray
+                }
+
+                $startTime = Get-Date
+                Write-Host "`nSending request at $startTime..." -ForegroundColor Yellow
+                
+                $ProgressPreference = 'SilentlyContinue'  # Disable progress bar for better performance
+                $response = Invoke-WebRequest -Uri $url -Headers $headers -UseBasicParsing -TimeoutSec $currentTimeout -MaximumRedirection 5 -Verbose
+                $endTime = Get-Date
+                $duration = ($endTime - $startTime).TotalSeconds
+                
+                Write-Host "`nResponse Details:" -ForegroundColor Cyan
+                Write-Host "Status Code: $($response.StatusCode)" -ForegroundColor Yellow
+                Write-Host "Status Description: $($response.StatusDescription)" -ForegroundColor Yellow
+                Write-Host "Time Taken: $duration seconds" -ForegroundColor Yellow
+                Write-Host "`nResponse Headers:" -ForegroundColor Yellow
+                $response.Headers.GetEnumerator() | ForEach-Object {
+                    Write-Host "  $($_.Key): $($_.Value)" -ForegroundColor Gray
+                }
+                
+                $pageContent = $response.Content
                 $success = $true
-                
-                $reader.Close()
-                $stream.Close()
-                $response.Close()
+            }
+            catch [System.Net.WebException] {
+                $errorResponse = $_.Exception.Response
+                Write-Host "`nWeb Exception Details:" -ForegroundColor Red
+                Write-Host "Status: $($_.Exception.Status)" -ForegroundColor Red
+                Write-Host "Message: $($_.Exception.Message)" -ForegroundColor Red
+                if ($errorResponse) {
+                    Write-Host "Response Status: $($errorResponse.StatusCode.value__) $($errorResponse.StatusDescription)" -ForegroundColor Red
+                }
+                throw
             }
             catch {
+                Write-Host "Error details: $($_.Exception.Message)" -ForegroundColor Red
                 if ($retryCount -lt $maxRetries) {
                     Write-Host "Attempt failed, retrying in 5 seconds..." -ForegroundColor Yellow
                     Start-Sleep -Seconds 5
@@ -85,28 +171,34 @@ function Get-AMDDriverDownload {
                 Write-Host "Full Match: $($matches[0])" -ForegroundColor Yellow
                 Write-Host "Extracted URL: $downloadUrl" -ForegroundColor Green
                 
-                # Continue with download process
-                if (Test-URLValid -URL $downloadUrl) {
-                    $fileName = Split-Path $downloadUrl -Leaf
-                    $outputPath = Join-Path $downloadDir $fileName
-                    
-                    try {
+                try {
+                    # Continue with download process
+                    if (Test-URLValid -URL $downloadUrl) {
+                        $fileName = Split-Path $downloadUrl -Leaf
+                        $outputPath = Join-Path $downloadDir $fileName
+                        
                         Write-Host "Downloading $fileName..." -ForegroundColor Yellow
                         $webClient = New-Object System.Net.WebClient
+                        $webClient.Headers.Add("Referer", "https://www.amd.com/")
+                        $webClient.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
                         $webClient.DownloadFile($downloadUrl, $outputPath)
                         Write-Host "Download complete: $outputPath" -ForegroundColor Green
                         return $outputPath
                     }
-                    catch {
-                        Write-Host "Download failed: $_" -ForegroundColor Red
-                        return $null
+                    else {
+                        throw "Download URL validation failed"
                     }
                 }
-                else {
-                    Write-Host "Download URL not accessible" -ForegroundColor Red
+                catch {
+                    Write-Host "Download failed: $_" -ForegroundColor Red
                     Write-Host "Opening AMD download page in browser..." -ForegroundColor Yellow
                     Start-Process "https://www.amd.com/en/support/downloads/drivers.html/processors/ryzen/ryzen-7000-series/amd-ryzen-7-7840u.html"
                     return $null
+                }
+                finally {
+                    if ($webClient) {
+                        $webClient.Dispose()
+                    }
                 }
             }
             else {
@@ -122,7 +214,6 @@ function Get-AMDDriverDownload {
         else {
             Write-Host "`nAutomatic download failed after $maxRetries attempts." -ForegroundColor Red
             Write-Host "Opening AMD download page in browser..." -ForegroundColor Yellow
-            Start-Process "https://www.amd.com/en/support/downloads/drivers.html/processors/ryzen/ryzen-7000-series/amd-ryzen-7-7840u.html"
             
             # Allow manual path input
             Write-Host "`nOnce you've downloaded the driver manually:" -ForegroundColor Cyan
